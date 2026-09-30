@@ -26,6 +26,10 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Validate workflow contracts
+        working-directory: .
+        run: python3 -m unittest tests/test_workflow_contracts.py -v
+
       - name: Login to Azure
         uses: azure/login@v2
         with:

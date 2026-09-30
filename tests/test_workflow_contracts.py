@@ -10,10 +10,18 @@ WORKFLOWS = REPOSITORY_ROOT / ".github" / "workflows"
 class ProductionWorkflowContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        cls.ci = (WORKFLOWS / "01-ci.yml").read_text()
         cls.staging_deployment = (WORKFLOWS / "02-deploy-staging.yml").read_text()
         cls.staging_test = (WORKFLOWS / "03-staging-test.yml").read_text()
         cls.production = (WORKFLOWS / "04-deploy-production.yml").read_text()
         cls.drift = (WORKFLOWS / "05-drift-detection.yml").read_text()
+
+    def test_ci_runs_the_workflow_contract_suite(self):
+        self.assertIn("      - name: Validate workflow contracts", self.ci)
+        self.assertIn(
+            "run: python3 -m unittest tests/test_workflow_contracts.py -v",
+            self.ci,
+        )
 
     def test_each_promotion_requires_its_upstream_workflow_to_succeed(self):
         success_condition = "    if: ${{ github.event.workflow_run.conclusion == 'success' }}"
