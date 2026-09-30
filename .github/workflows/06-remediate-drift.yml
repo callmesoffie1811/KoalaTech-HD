@@ -1,0 +1,424 @@
+name: 06 - Controlled Drift Remediation
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_remediation:
+        description: "Confirm controlled Terraform remediation"
+        required: true
+        default: "NO"
+        type: choice
+        options:
+          - "NO"
+          - "YES"
+
+permissions:
+  contents: read
+
+# Use the same Terraform state lock group as workflow 05.
+# This prevents drift detection and remediation from modifying/
+# reading the shared state at the same time.
+concurrency:
+  group: koalatech-terraform-state
+  cancel-in-progress: false
+
+jobs:
+  remediate-drift:
+    name: Review, Remediate and Verify Drift
+
+    # Run only after explicit manual confirmation from the protected
+    # main branch. workflow_dispatch allows users to select a branch.
+    if: >-
+      ${{
+        inputs.confirm_remediation == 'YES' &&
+        github.ref == 'refs/heads/main'
+      }}
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    environment:
+      name: production
+
+    defaults:
+      run:
+        shell: bash
+        working-directory: terraform
+
+    env:
+      TF_IN_AUTOMATION: "true"
+
+    steps:
+      # =========================================================
+      # 1. Checkout Terraform desired state
+      # =========================================================
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # =========================================================
+      # 2. Authenticate to Azure
+      # =========================================================
+      - name: Login to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      # =========================================================
+      # 3. Configure Terraform
+      #
+      # Disable the Terraform wrapper so native exit codes
+      # are available during verification.
+      # =========================================================
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      # =========================================================
+      # 4. Initialise remote Terraform state
+      # =========================================================
+      - name: Terraform Init
+        run: terraform init -input=false
+
+      # =========================================================
+      # 5. Validate repository configuration
+      # =========================================================
+      - name: Terraform Validate
+        run: terraform validate
+
+      # =========================================================
+      # 6. Create exact remediation plan
+      #
+      # The plan is saved so that the exact reviewed plan,
+      # rather than a newly generated plan, is applied later.
+      # =========================================================
+      - name: Create Remediation Plan
+        id: plan
+        run: |
+          terraform plan \
+            -input=false \
+            -no-color \
+            -out=remediation.tfplan
+
+          terraform show \
+            -no-color \
+            remediation.tfplan \
+            > remediation-plan.txt
+
+          terraform show \
+            -json \
+            remediation.tfplan \
+            > remediation-plan.json
+
+          CHANGE_COUNT=$(jq '
+            [
+              .resource_changes[]?
+              | select(.change.actions != ["no-op"])
+            ]
+            | length
+          ' remediation-plan.json)
+
+          RESOURCES=$(jq -r '
+            [
+              .resource_changes[]?
+              | select(.change.actions != ["no-op"])
+              | .address
+            ]
+            | unique
+            | if length == 0
+                then ["None"]
+                else .
+              end
+            | join(", ")
+          ' remediation-plan.json)
+
+          # Keep the full JSON only on the ephemeral runner. Terraform JSON
+          # can contain sensitive state values, so the retained artifact is
+          # reduced to the resource identities and planned actions required
+          # for remediation evidence.
+          jq '
+            {
+              format_version: .format_version,
+              terraform_version: .terraform_version,
+              resource_changes: [
+                .resource_changes[]?
+                | select(.change.actions != ["no-op"])
+                | {
+                    address: .address,
+                    mode: .mode,
+                    type: .type,
+                    name: .name,
+                    actions: .change.actions
+                  }
+              ]
+            }
+          ' remediation-plan.json > remediation-evidence.json
+
+          echo "change_count=$CHANGE_COUNT" >> "$GITHUB_OUTPUT"
+          echo "resources=$RESOURCES" >> "$GITHUB_OUTPUT"
+
+          echo "Resources requiring remediation: $RESOURCES"
+          echo "Number of resources with changes: $CHANGE_COUNT"
+
+      # =========================================================
+      # 7. Safety gate
+      #
+      # Any action containing "delete" is rejected.
+      # This also blocks replacements such as:
+      # ["delete", "create"] or ["create", "delete"].
+      # =========================================================
+      - name: Safety Check - Block Destructive Changes
+        id: safety
+        run: |
+          DELETE_COUNT=$(jq '
+            [
+              .resource_changes[]?
+              | select(
+                  (.change.actions | index("delete")) != null
+                )
+            ]
+            | length
+          ' remediation-plan.json)
+
+          echo "Resources containing delete actions: $DELETE_COUNT"
+
+          if [ "$DELETE_COUNT" -gt 0 ]; then
+            echo "safe=false" >> "$GITHUB_OUTPUT"
+            echo "delete_count=$DELETE_COUNT" >> "$GITHUB_OUTPUT"
+            echo "SAFETY CHECK FAILED"
+            echo "The Terraform plan contains destructive actions."
+            echo "Remediation will be blocked after evidence is uploaded."
+          else
+            echo "safe=true" >> "$GITHUB_OUTPUT"
+            echo "delete_count=0" >> "$GITHUB_OUTPUT"
+            echo "Safety check passed."
+            echo "No destructive actions were found."
+          fi
+
+      # =========================================================
+      # 8. Record remediation plan in GitHub summary
+      # =========================================================
+      - name: Write Remediation Plan Summary
+        if: always()
+        env:
+          CHANGE_COUNT: ${{ steps.plan.outputs.change_count }}
+          DELETE_COUNT: ${{ steps.safety.outputs.delete_count }}
+          RESOURCES: ${{ steps.plan.outputs.resources }}
+          SAFE_TO_APPLY: ${{ steps.safety.outputs.safe }}
+        run: |
+          if [ "$SAFE_TO_APPLY" = "true" ]; then
+            SAFETY_SUMMARY="Passed — no delete actions detected"
+          elif [ "$SAFE_TO_APPLY" = "false" ]; then
+            SAFETY_SUMMARY="Blocked — $DELETE_COUNT resource(s) contain delete actions"
+          else
+            SAFETY_SUMMARY="Unavailable — plan creation or safety analysis failed"
+          fi
+
+          echo "## KoalaTech Controlled Drift Remediation" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Manual approval:** YES" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Resources requiring remediation:** ${RESOURCES:-Unavailable}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Resources with changes:** ${CHANGE_COUNT:-Unavailable}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Safety check:** $SAFETY_SUMMARY" >> "$GITHUB_STEP_SUMMARY"
+
+      # =========================================================
+      # 9. Preserve remediation plan as evidence
+      # =========================================================
+      - name: Upload Remediation Plan Evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-remediation-plan
+          path: |
+            terraform/remediation-plan.txt
+            terraform/remediation-evidence.json
+          if-no-files-found: warn
+          retention-days: 7
+
+      # =========================================================
+      # 10. Stop destructive or otherwise unsafe remediation
+      # =========================================================
+      - name: Block Unsafe Remediation
+        if: ${{ steps.safety.outputs.safe == 'false' }}
+        run: |
+          echo "Controlled remediation is blocked because the plan contains delete actions."
+          exit 1
+
+      # =========================================================
+      # 11. Apply the exact approved plan
+      #
+      # Using the saved plan ensures Terraform applies the same
+      # actions that passed the safety check.
+      # =========================================================
+      - name: Apply Approved Remediation Plan
+        if: ${{ steps.safety.outputs.safe == 'true' }}
+        run: |
+          terraform apply \
+            -input=false \
+            remediation.tfplan
+
+      # =========================================================
+      # 12. Verify desired state after remediation
+      #
+      # Important:
+      # This must be a NORMAL Terraform plan.
+      # Do NOT use -refresh-only.
+      #
+      # Exit codes:
+      #   0 = healthy / no changes remain
+      #   1 = Terraform verification error
+      #   2 = changes still remain
+      # =========================================================
+      - name: Verify Infrastructure State
+        id: verify
+        run: |
+          set +e
+
+          terraform plan \
+            -detailed-exitcode \
+            -input=false \
+            -no-color \
+            > verification.txt 2>&1
+
+          VERIFY_CODE=$?
+
+          set -e
+
+          echo "exit_code=$VERIFY_CODE" >> "$GITHUB_OUTPUT"
+
+          if [ "$VERIFY_CODE" -eq 0 ]; then
+
+            echo "status=healthy" >> "$GITHUB_OUTPUT"
+            echo "Verification result: HEALTHY"
+
+          elif [ "$VERIFY_CODE" -eq 2 ]; then
+
+            echo "status=changes_remaining" >> "$GITHUB_OUTPUT"
+            echo "Verification result: CHANGES STILL REMAIN"
+
+          else
+
+            echo "status=error" >> "$GITHUB_OUTPUT"
+            echo "Verification result: TERRAFORM ERROR"
+
+          fi
+
+          # Do not stop here so diagnostics and Teams notification
+          # logic can still execute.
+          exit 0
+
+      # =========================================================
+      # 13. Upload verification evidence
+      # =========================================================
+      - name: Upload Verification Evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-remediation-verification
+          path: terraform/verification.txt
+          retention-days: 7
+
+      # =========================================================
+      # 14. Add final result to GitHub summary
+      # =========================================================
+      - name: Write Verification Summary
+        if: always()
+        run: |
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Post-Remediation Verification" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Status:** ${{ steps.verify.outputs.status }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Terraform exit code:** ${{ steps.verify.outputs.exit_code }}" >> "$GITHUB_STEP_SUMMARY"
+
+      # =========================================================
+      # 15. Teams recovery Adaptive Card
+      #
+      # Your Microsoft Teams workflow requires an Adaptive Card.
+      # =========================================================
+      - name: Send Teams Recovery Notification
+        if: ${{ steps.verify.outputs.status == 'healthy' }}
+        env:
+          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+        run: |
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          RECOVERED="$(TZ=Australia/Melbourne date '+%Y-%m-%d %H:%M:%S %Z')"
+
+          jq -n \
+            --arg resources "${{ steps.plan.outputs.resources }}" \
+            --arg recovered "$RECOVERED" \
+            --arg run_url "$RUN_URL" \
+            '{
+              "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+              "type": "AdaptiveCard",
+              "version": "1.4",
+              "body": [
+                {
+                  "type": "TextBlock",
+                  "size": "Medium",
+                  "weight": "Bolder",
+                  "text": "✅ KoalaTech Infrastructure Restored"
+                },
+                {
+                  "type": "FactSet",
+                  "facts": [
+                    {
+                      "title": "Environment",
+                      "value": "Azure"
+                    },
+                    {
+                      "title": "Status",
+                      "value": "HEALTHY"
+                    },
+                    {
+                      "title": "Remediated resource(s)",
+                      "value": $resources
+                    },
+                    {
+                      "title": "Verified",
+                      "value": $recovered
+                    },
+                    {
+                      "title": "Terraform exit code",
+                      "value": "0"
+                    }
+                  ]
+                },
+                {
+                  "type": "TextBlock",
+                  "text": "Controlled remediation completed successfully and the live Azure infrastructure now matches the Terraform desired state.",
+                  "wrap": true
+                },
+                {
+                  "type": "ActionSet",
+                  "actions": [
+                    {
+                      "type": "Action.OpenUrl",
+                      "title": "Open GitHub Actions Run",
+                      "url": $run_url
+                    }
+                  ]
+                }
+              ]
+            }' > teams-recovery-card.json
+
+          curl --fail-with-body \
+            --retry 3 \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -d @teams-recovery-card.json \
+            "$TEAMS_WEBHOOK_URL"
+
+      # =========================================================
+      # 16. Fail if remediation did not restore healthy state
+      # =========================================================
+      - name: Fail if Verification Is Not Healthy
+        if: ${{ steps.verify.outputs.status != 'healthy' }}
+        run: |
+          echo "Controlled remediation did not restore the expected Terraform state."
+          echo "Verification status: ${{ steps.verify.outputs.status }}"
+          echo "Terraform exit code: ${{ steps.verify.outputs.exit_code }}"
+          exit 1
