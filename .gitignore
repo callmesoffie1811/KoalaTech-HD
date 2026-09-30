@@ -197,6 +197,10 @@ cython_debug/
 .cursorindexingignore
 
 node_modules/
+
+# Local Git worktrees
+.worktrees/
+
 # Terraform
 .terraform/
 *.tfstate
