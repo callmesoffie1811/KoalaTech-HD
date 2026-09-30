@@ -1,18 +1,13 @@
-location            = "Australia East"
-resource_group_name = "koalatech-week08-rg"
+location = "Australia East"
 
-# Azure Container Registry names must be globally unique
-acr_name = "koalatech102dacr09231036"
+resource_group_name = "koalatech-hd-rg"
 
-# Storage Account names must be globally unique, lowercase,
-# alphanumeric, and no more than 24 characters
-storage_account_name = "kt102d09231036"
+acr_name             = "koalatechhdacr0923"
+storage_account_name = "koalatechhd0923"
 
-# AKS cluster
-aks_cluster_name = "koalatech-week08-aks"
-aks_dns_prefix   = "koalatech-week08"
+aks_cluster_name = "koalatech-hd-aks"
+aks_dns_prefix   = "koalatech-hd"
 
-# Week 08 requires THREE nodes
 aks_node_count   = 3
 aks_node_vm_size = "Standard_D2s_v6"
 
@@ -21,6 +16,7 @@ environment = "development"
 tags = {
   Project     = "KoalaTech Course Platform"
   ManagedBy   = "Terraform"
-  Practical   = "Task10.2D"
+  Practical   = "Task10.3HD"
   Environment = "Development"
+  HDFeature   = "Infrastructure Drift Detection"
 }
