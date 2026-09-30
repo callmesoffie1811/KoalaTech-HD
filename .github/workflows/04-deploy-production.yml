@@ -1,0 +1,237 @@
+name: 04 - Deploy to Production
+
+on:
+  workflow_run:
+    workflows:
+      - "03 - Test Staging"
+    types:
+      - completed
+    branches:
+      - main
+
+jobs:
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+
+    # Only deploy when the staging test completed successfully
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+
+    environment:
+      name: production
+
+    steps:
+      # ---------------------------------------------------------
+      # Checkout the same commit that passed staging validation
+      # ---------------------------------------------------------
+      - name: Checkout tested commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      # ---------------------------------------------------------
+      # Azure authentication
+      # ---------------------------------------------------------
+      - name: Login to Azure
+        uses: azure/login@v3
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Get AKS credentials
+        run: |
+          az aks get-credentials \
+            --resource-group ${{ vars.AKS_RESOURCE_GROUP }} \
+            --name ${{ vars.AKS_CLUSTER_NAME }} \
+            --overwrite-existing
+
+      # ---------------------------------------------------------
+      # Prepare production namespace
+      # ---------------------------------------------------------
+      - name: Create production namespace
+        run: |
+          kubectl create namespace production \
+            --dry-run=client \
+            -o yaml | kubectl apply -f -
+
+      # ---------------------------------------------------------
+      # Create production secrets
+      # ---------------------------------------------------------
+      - name: Create PostgreSQL secret
+        run: |
+          kubectl create secret generic postgres-secret \
+            --namespace production \
+            --from-literal=POSTGRES_USER="${{ secrets.POSTGRES_USER }}" \
+            --from-literal=POSTGRES_PASSWORD="${{ secrets.POSTGRES_PASSWORD }}" \
+            --dry-run=client \
+            -o yaml | kubectl apply -f -
+
+      - name: Create application secret
+        run: |
+          kubectl create secret generic application-secret \
+            --namespace production \
+            --from-literal=POSTGRES_USER="${{ secrets.POSTGRES_USER }}" \
+            --from-literal=POSTGRES_PASSWORD="${{ secrets.POSTGRES_PASSWORD }}" \
+            --from-literal=JWT_SECRET_KEY="${{ secrets.JWT_SECRET_KEY }}" \
+            --from-literal=DEFAULT_ADMIN_USERNAME="${{ secrets.DEFAULT_ADMIN_USERNAME }}" \
+            --from-literal=DEFAULT_ADMIN_EMAIL="${{ secrets.DEFAULT_ADMIN_EMAIL }}" \
+            --from-literal=DEFAULT_ADMIN_PASSWORD="${{ secrets.DEFAULT_ADMIN_PASSWORD }}" \
+            --from-literal=AZURE_STORAGE_CONNECTION_STRING="${{ secrets.AZURE_STORAGE_CONNECTION_STRING }}" \
+            --dry-run=client \
+            -o yaml | kubectl apply -f -
+
+      # ---------------------------------------------------------
+      # Apply production Kubernetes manifests
+      # ---------------------------------------------------------
+      - name: Apply Kubernetes manifests
+        run: |
+          kubectl apply \
+            -f kubernetes/production/
+
+      # ---------------------------------------------------------
+      # Promote the exact image SHA that passed staging
+      # ---------------------------------------------------------
+      - name: Update frontend image
+        run: |
+          kubectl set image deployment/frontend \
+            frontend=${{ vars.ACR_LOGIN_SERVER }}/koalatech-frontend:${{ github.event.workflow_run.head_sha }} \
+            -n production
+
+      - name: Update user-service image
+        run: |
+          kubectl set image deployment/user-service \
+            user-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-user-service:${{ github.event.workflow_run.head_sha }} \
+            -n production
+
+      - name: Update student-service image
+        run: |
+          kubectl set image deployment/student-service \
+            student-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-student-service:${{ github.event.workflow_run.head_sha }} \
+            -n production
+
+      - name: Update lecturer-service image
+        run: |
+          kubectl set image deployment/lecturer-service \
+            lecturer-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-lecturer-service:${{ github.event.workflow_run.head_sha }} \
+            -n production
+
+      - name: Update course-service image
+        run: |
+          kubectl set image deployment/course-service \
+            course-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-course-service:${{ github.event.workflow_run.head_sha }} \
+            -n production
+
+      - name: Update enrollment-service image
+        run: |
+          kubectl set image deployment/enrollment-service \
+            enrollment-service=${{ vars.ACR_LOGIN_SERVER }}/koalatech-enrollment-service:${{ github.event.workflow_run.head_sha }} \
+            -n production
+
+      # ---------------------------------------------------------
+      # Wait for all production deployments
+      # ---------------------------------------------------------
+      - name: Wait for frontend rollout
+        run: |
+          kubectl rollout status deployment/frontend \
+            -n production \
+            --timeout=300s
+
+      - name: Wait for user-service rollout
+        run: |
+          kubectl rollout status deployment/user-service \
+            -n production \
+            --timeout=300s
+
+      - name: Wait for student-service rollout
+        run: |
+          kubectl rollout status deployment/student-service \
+            -n production \
+            --timeout=300s
+
+      - name: Wait for lecturer-service rollout
+        run: |
+          kubectl rollout status deployment/lecturer-service \
+            -n production \
+            --timeout=300s
+
+      - name: Wait for course-service rollout
+        run: |
+          kubectl rollout status deployment/course-service \
+            -n production \
+            --timeout=300s
+
+      - name: Wait for enrollment-service rollout
+        run: |
+          kubectl rollout status deployment/enrollment-service \
+            -n production \
+            --timeout=300s
+
+      # ---------------------------------------------------------
+      # Display deployed production resources
+      # ---------------------------------------------------------
+      - name: Show production resources
+        run: |
+          echo "=== Production Pods ==="
+          kubectl get pods -n production
+
+          echo ""
+          echo "=== Production Services ==="
+          kubectl get services -n production
+
+          echo ""
+          echo "=== Production Persistent Volume Claims ==="
+          kubectl get pvc -n production
+
+      # ---------------------------------------------------------
+      # Wait for frontend LoadBalancer IP
+      # ---------------------------------------------------------
+      - name: Wait for production frontend IP
+        run: |
+          for i in {1..30}; do
+
+            FRONTEND_IP=$(kubectl get service frontend \
+              -n production \
+              -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+
+            if [ -n "$FRONTEND_IP" ]; then
+              echo "PROD_IP=$FRONTEND_IP" >> "$GITHUB_ENV"
+              echo "Production IP: $FRONTEND_IP"
+              exit 0
+            fi
+
+            echo "Waiting for production frontend IP..."
+            sleep 10
+          done
+
+          echo "Unable to find production frontend IP."
+          exit 1
+
+      # ---------------------------------------------------------
+      # Verify that production is actually reachable
+      # ---------------------------------------------------------
+      - name: Verify production frontend
+        run: |
+          curl \
+            --fail \
+            --retry 10 \
+            --retry-delay 5 \
+            http://${{ env.PROD_IP }}
+
+      # ---------------------------------------------------------
+      # Print final production URL
+      # ---------------------------------------------------------
+      - name: Show production URL
+        run: |
+          echo "Production deployment completed successfully."
+          echo "Production URL: http://${{ env.PROD_IP }}"
+
+  # Run the HD monitoring extension only after the existing Task 9.3C
+  # production deployment has completed successfully. Calling the workflow
+  # directly avoids adding a fourth workflow_run level.
+  post-deployment-drift-check:
+    name: Post-Deployment Drift Detection
+    needs: deploy-production
+    uses: ./.github/workflows/05-drift-detection.yml
+    with:
+      simulate_error: false
+      source_sha: ${{ github.event.workflow_run.head_sha }}
+    secrets: inherit
