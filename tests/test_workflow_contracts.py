@@ -77,6 +77,13 @@ class ProductionWorkflowContractTests(unittest.TestCase):
             with self.subTest(fragment=fragment):
                 self.assertIn(fragment, self.drift)
 
+    def test_both_teams_alerts_use_melbourne_time(self):
+        timestamp = (
+            'DETECTED="$(TZ=Australia/Melbourne '
+            "date '+%Y-%m-%d %H:%M:%S %Z')\""
+        )
+        self.assertEqual(self.drift.count(timestamp), 2)
+
 
 if __name__ == "__main__":
     unittest.main()
