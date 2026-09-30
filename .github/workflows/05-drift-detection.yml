@@ -1,0 +1,270 @@
+name: 05 - Infrastructure Drift Detection
+
+on:
+  workflow_dispatch:
+    inputs:
+      simulate_error:
+        description: "Simulate Terraform monitoring failure"
+        required: false
+        default: false
+        type: boolean
+
+  schedule:
+    - cron: "15 2 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  drift-detection:
+    name: Detect Infrastructure Drift
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        shell: bash
+        working-directory: terraform
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Login to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        run: terraform init -input=false
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      # Controlled failure experiment
+      - name: Inject Controlled Terraform Error
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.simulate_error }}
+        run: |
+          echo 'this is deliberately invalid terraform {' > simulated-error.tf
+
+      # Drift detection
+      - name: Detect Infrastructure Drift
+        id: drift
+        run: |
+          set +e
+
+          terraform plan \
+            -refresh-only \
+            -detailed-exitcode \
+            -input=false \
+            -no-color \
+            -out=drift.tfplan \
+            > drift-plan.txt 2>&1
+
+          EXIT_CODE=$?
+
+          set -e
+
+          echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+
+          if [ "$EXIT_CODE" -eq 0 ]; then
+
+            echo "status=healthy" >> "$GITHUB_OUTPUT"
+            echo "resources=None" >> "$GITHUB_OUTPUT"
+
+            echo "Infrastructure status: HEALTHY"
+
+          elif [ "$EXIT_CODE" -eq 2 ]; then
+
+            echo "status=drift" >> "$GITHUB_OUTPUT"
+
+            terraform show -json drift.tfplan > drift-plan.json
+
+            RESOURCES=$(jq -r '
+              [.resource_drift[]?.address]
+              | unique
+              | if length == 0
+                  then ["See Terraform diagnostic artifact"]
+                  else .
+                end
+              | join(", ")
+            ' drift-plan.json)
+
+            echo "resources=$RESOURCES" >> "$GITHUB_OUTPUT"
+
+            echo "Infrastructure status: DRIFT"
+            echo "Affected resources: $RESOURCES"
+
+          else
+
+            echo "status=error" >> "$GITHUB_OUTPUT"
+            echo "resources=N/A" >> "$GITHUB_OUTPUT"
+
+            echo "Infrastructure monitoring status: ERROR"
+          fi
+
+          exit 0
+
+      - name: Cleanup Controlled Error
+        if: always()
+        run: |
+          rm -f simulated-error.tf
+
+      # GitHub summary
+      - name: Write Monitoring Summary
+        if: always()
+        run: |
+          echo "## KoalaTech Infrastructure Drift Check" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Status:** ${{ steps.drift.outputs.status }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Terraform exit code:** ${{ steps.drift.outputs.exit_code }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Affected resources:** ${{ steps.drift.outputs.resources }}" >> "$GITHUB_STEP_SUMMARY"
+
+      # Preserve diagnostics
+      - name: Upload Terraform Diagnostics
+        if: ${{ steps.drift.outputs.status != 'healthy' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-drift-diagnostics
+          path: terraform/drift-plan.txt
+          retention-days: 7
+
+      # Teams drift Adaptive Card
+      - name: Send Teams Drift Alert
+        if: ${{ steps.drift.outputs.status == 'drift' }}
+        env:
+          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+        run: |
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          DETECTED="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+
+          jq -n \
+            --arg resource "${{ steps.drift.outputs.resources }}" \
+            --arg detected "$DETECTED" \
+            --arg run_url "$RUN_URL" \
+            '{
+              "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+              "type": "AdaptiveCard",
+              "version": "1.4",
+              "body": [
+                {
+                  "type": "TextBlock",
+                  "size": "Medium",
+                  "weight": "Bolder",
+                  "text": "⚠️ KoalaTech Infrastructure Drift Detected"
+                },
+                {
+                  "type": "FactSet",
+                  "facts": [
+                    {
+                      "title": "Environment",
+                      "value": "Azure"
+                    },
+                    {
+                      "title": "Status",
+                      "value": "DRIFT"
+                    },
+                    {
+                      "title": "Resources",
+                      "value": $resource
+                    },
+                    {
+                      "title": "Detected",
+                      "value": $detected
+                    }
+                  ]
+                },
+                {
+                  "type": "TextBlock",
+                  "text": "Review the detected infrastructure change before remediation.",
+                  "wrap": true
+                },
+                {
+                  "type": "ActionSet",
+                  "actions": [
+                    {
+                      "type": "Action.OpenUrl",
+                      "title": "Open GitHub Actions Run",
+                      "url": $run_url
+                    }
+                  ]
+                }
+              ]
+            }' > teams-card.json
+
+          curl --fail-with-body \
+            --retry 3 \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -d @teams-card.json \
+            "$TEAMS_WEBHOOK_URL"
+
+      # Separate monitoring error Adaptive Card
+      - name: Send Teams Monitoring Error
+        if: ${{ steps.drift.outputs.status == 'error' }}
+        env:
+          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+        run: |
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          jq -n \
+            --arg exit_code "${{ steps.drift.outputs.exit_code }}" \
+            --arg run_url "$RUN_URL" \
+            '{
+              "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+              "type": "AdaptiveCard",
+              "version": "1.4",
+              "body": [
+                {
+                  "type": "TextBlock",
+                  "size": "Medium",
+                  "weight": "Bolder",
+                  "text": "❌ KoalaTech Drift Monitoring Error"
+                },
+                {
+                  "type": "FactSet",
+                  "facts": [
+                    {
+                      "title": "Status",
+                      "value": "MONITORING ERROR"
+                    },
+                    {
+                      "title": "Terraform exit code",
+                      "value": $exit_code
+                    }
+                  ]
+                },
+                {
+                  "type": "TextBlock",
+                  "text": "This result is NOT classified as infrastructure drift.",
+                  "wrap": true
+                },
+                {
+                  "type": "ActionSet",
+                  "actions": [
+                    {
+                      "type": "Action.OpenUrl",
+                      "title": "Open GitHub Actions Run",
+                      "url": $run_url
+                    }
+                  ]
+                }
+              ]
+            }' > teams-error-card.json
+
+          curl --fail-with-body \
+            --retry 3 \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -d @teams-error-card.json \
+            "$TEAMS_WEBHOOK_URL"
+
+      - name: Fail Monitoring Job on Terraform Error
+        if: ${{ steps.drift.outputs.status == 'error' }}
+        run: |
+          echo "Terraform monitoring failed."
+          exit 1
