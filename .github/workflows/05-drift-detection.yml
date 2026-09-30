@@ -297,7 +297,7 @@ jobs:
           TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
         run: |
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          DETECTED="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          DETECTED="$(TZ=Australia/Melbourne date '+%Y-%m-%d %H:%M:%S %Z')"
 
           jq -n \
             --arg exit_code "${{ steps.drift.outputs.exit_code }}" \
