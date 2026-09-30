@@ -1,6 +1,7 @@
 name: 05 - Infrastructure Drift Detection
 
 on:
+  # Manual run for demonstrations and controlled experiments
   workflow_dispatch:
     inputs:
       simulate_error:
@@ -9,54 +10,96 @@ on:
         default: false
         type: boolean
 
+  # Automated daily drift check
+  # GitHub Actions cron uses UTC
   schedule:
     - cron: "15 2 * * *"
 
 permissions:
   contents: read
 
+# Avoid multiple Terraform monitoring runs using the same state at the same time
+concurrency:
+  group: koalatech-terraform-state
+  cancel-in-progress: false
+
 jobs:
   drift-detection:
     name: Detect Infrastructure Drift
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     defaults:
       run:
         shell: bash
         working-directory: terraform
 
+    env:
+      TF_IN_AUTOMATION: "true"
+
     steps:
+      # =========================================================
+      # 1. Checkout repository
+      # =========================================================
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # =========================================================
+      # 2. Authenticate GitHub Actions to Azure
+      # =========================================================
       - name: Login to Azure
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
+      # =========================================================
+      # 3. Configure Terraform
+      # =========================================================
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
 
+      # =========================================================
+      # 4. Initialise remote Azure Blob backend
+      # =========================================================
       - name: Terraform Init
         run: terraform init -input=false
 
+      # =========================================================
+      # 5. Validate Terraform configuration
+      # =========================================================
       - name: Terraform Validate
         run: terraform validate
 
-      # Controlled failure experiment
+      # =========================================================
+      # 6. Controlled monitoring failure experiment
+      #
+      # Used only when simulate_error = true.
+      # The invalid file exists only in the temporary GitHub runner.
+      # =========================================================
       - name: Inject Controlled Terraform Error
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.simulate_error }}
         run: |
           echo 'this is deliberately invalid terraform {' > simulated-error.tf
 
-      # Drift detection
+      # =========================================================
+      # 7. Detect infrastructure drift
+      #
+      # Exit codes:
+      #   0 = configuration matches Azure
+      #   1 = Terraform / monitoring error
+      #   2 = Terraform has changes to make
+      #
+      # A clean baseline is established before testing, therefore
+      # externally introduced Azure changes are classified as drift.
+      # =========================================================
       - name: Detect Infrastructure Drift
         id: drift
         run: |
           set +e
 
           terraform plan \
-            -refresh-only \
             -detailed-exitcode \
             -input=false \
             -no-color \
@@ -80,10 +123,16 @@ jobs:
 
             echo "status=drift" >> "$GITHUB_OUTPUT"
 
+            # Convert the Terraform plan to JSON so the affected
+            # resources can be extracted automatically.
             terraform show -json drift.tfplan > drift-plan.json
 
             RESOURCES=$(jq -r '
-              [.resource_drift[]?.address]
+              [
+                .resource_changes[]?
+                | select(.change.actions != ["no-op"])
+                | .address
+              ]
               | unique
               | if length == 0
                   then ["See Terraform diagnostic artifact"]
@@ -103,16 +152,24 @@ jobs:
             echo "resources=N/A" >> "$GITHUB_OUTPUT"
 
             echo "Infrastructure monitoring status: ERROR"
+
           fi
 
+          # Keep this step successful so later steps can generate
+          # diagnostics and Teams notifications.
           exit 0
 
+      # =========================================================
+      # 8. Remove controlled test file
+      # =========================================================
       - name: Cleanup Controlled Error
         if: always()
         run: |
           rm -f simulated-error.tf
 
-      # GitHub summary
+      # =========================================================
+      # 9. Write useful GitHub Actions summary
+      # =========================================================
       - name: Write Monitoring Summary
         if: always()
         run: |
@@ -124,7 +181,9 @@ jobs:
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "**Affected resources:** ${{ steps.drift.outputs.resources }}" >> "$GITHUB_STEP_SUMMARY"
 
-      # Preserve diagnostics
+      # =========================================================
+      # 10. Preserve diagnostics when drift/error occurs
+      # =========================================================
       - name: Upload Terraform Diagnostics
         if: ${{ steps.drift.outputs.status != 'healthy' }}
         uses: actions/upload-artifact@v4
@@ -133,7 +192,9 @@ jobs:
           path: terraform/drift-plan.txt
           retention-days: 7
 
-      # Teams drift Adaptive Card
+      # =========================================================
+      # 11. Send Microsoft Teams alert for real drift
+      # =========================================================
       - name: Send Teams Drift Alert
         if: ${{ steps.drift.outputs.status == 'drift' }}
         env:
@@ -169,7 +230,7 @@ jobs:
                       "value": "DRIFT"
                     },
                     {
-                      "title": "Resources",
+                      "title": "Affected resource(s)",
                       "value": $resource
                     },
                     {
@@ -203,16 +264,22 @@ jobs:
             -d @teams-card.json \
             "$TEAMS_WEBHOOK_URL"
 
-      # Separate monitoring error Adaptive Card
+      # =========================================================
+      # 12. Send separate Teams alert for monitoring failure
+      #
+      # This is deliberately separate from infrastructure drift.
+      # =========================================================
       - name: Send Teams Monitoring Error
         if: ${{ steps.drift.outputs.status == 'error' }}
         env:
           TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
         run: |
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          DETECTED="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
 
           jq -n \
             --arg exit_code "${{ steps.drift.outputs.exit_code }}" \
+            --arg detected "$DETECTED" \
             --arg run_url "$RUN_URL" \
             '{
               "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
@@ -235,12 +302,16 @@ jobs:
                     {
                       "title": "Terraform exit code",
                       "value": $exit_code
+                    },
+                    {
+                      "title": "Detected",
+                      "value": $detected
                     }
                   ]
                 },
                 {
                   "type": "TextBlock",
-                  "text": "This result is NOT classified as infrastructure drift.",
+                  "text": "The monitoring process failed. This result is NOT classified as infrastructure drift.",
                   "wrap": true
                 },
                 {
@@ -263,6 +334,10 @@ jobs:
             -d @teams-error-card.json \
             "$TEAMS_WEBHOOK_URL"
 
+      # =========================================================
+      # 13. Mark monitoring errors as failed only AFTER
+      # diagnostics and notification have been generated.
+      # =========================================================
       - name: Fail Monitoring Job on Terraform Error
         if: ${{ steps.drift.outputs.status == 'error' }}
         run: |
