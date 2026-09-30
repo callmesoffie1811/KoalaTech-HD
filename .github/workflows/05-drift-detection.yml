@@ -10,6 +10,26 @@ on:
         default: false
         type: boolean
 
+  # Called by 04 after a successful production deployment. This preserves
+  # the existing workflow_run chain limit while reusing the same monitor.
+  workflow_call:
+    inputs:
+      simulate_error:
+        description: "Simulate Terraform monitoring failure"
+        required: false
+        default: false
+        type: boolean
+      source_sha:
+        description: "Commit containing the Terraform configuration to check"
+        required: false
+        default: ""
+        type: string
+    secrets:
+      AZURE_CREDENTIALS:
+        required: true
+      TEAMS_WEBHOOK_URL:
+        required: true
+
   # Automated daily drift check
   # GitHub Actions cron uses UTC
   schedule:
@@ -43,6 +63,8 @@ jobs:
       # =========================================================
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_sha || github.sha }}
 
       # =========================================================
       # 2. Authenticate GitHub Actions to Azure
@@ -79,7 +101,7 @@ jobs:
       # The invalid file exists only in the temporary GitHub runner.
       # =========================================================
       - name: Inject Controlled Terraform Error
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.simulate_error }}
+        if: ${{ inputs.simulate_error }}
         run: |
           echo 'this is deliberately invalid terraform {' > simulated-error.tf
 
